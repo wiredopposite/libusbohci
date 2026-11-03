@@ -38,6 +38,7 @@
 
 #define EHCI_PORT_CNT          2            /* Number of EHCI roothub ports               */
 #define OHCI_PORT_CNT          2            /* Number of OHCI roothub ports               */
+#define OHCI_HC_CNT            1            /* Number of OHCI host controllers            */
 //#define OHCI_PER_PORT_POWER               /* OHCI root hub per port powered             */
 
 #define OHCI_ISO_DELAY         4            /* preserved number frames while scheduling 
@@ -110,6 +111,7 @@
 #endif
 
 #define USBH                 ((USBH_T *)0xB0007000)
+#define USBH_BASE(i)         USBH
 #define HSUSBH               ((HSUSBH_T *)0xB0005000)
 
 

@@ -20,17 +20,13 @@
 
 /// @cond HIDDEN_SYMBOLS
 
-USBH_T     *_ohci;
-HSUSBH_T   *_ehci;
-
 static UDEV_DRV_T *  _drivers[MAX_UDEV_DRIVER];
 
 static CONN_FUNC  *g_conn_func, *g_disconn_func;
 
 
-extern void EHCI_IRQHandler(void);
-extern void OHCI_IRQHandler(void);
-
+static void enum_init(void);
+static void enum_abort(void);
 
 /// @endcond HIDDEN_SYMBOLS
 
@@ -47,13 +43,6 @@ void  usbh_core_init()
         return;
     usb_core_initialised = 1;
 
-    _ohci = USBH;
-    DISABLE_EHCI_IRQ();
-    DISABLE_OHCI_IRQ();
-
-    _ohci = USBH;
-    _ehci = HSUSBH;
-
     memset(_drivers, 0, sizeof(_drivers));
 
     g_conn_func = NULL;
@@ -61,22 +50,25 @@ void  usbh_core_init()
 
     usbh_hub_init();
     usbh_memory_init();
+    enum_init();
 
-    //_ohci->HcMiscControl |= USBH_HcMiscControl_OCAL_Msk; /* Over-current active low  */
-    _ohci->HcMiscControl &= ~USBH_HcMiscControl_OCAL_Msk; /* Over-current active high  */
+    for (int i = 0; i < OHCI_HC_CNT; i++)
+    {
+        HC_DRV_T  *hc = ohci_get_hc(i);
 
-#ifdef ENABLE_OHCI
-    usbh_ohci_irq_init();
-    ohci_driver.init();
-    ENABLE_OHCI_IRQ();
-#endif
+        usbh_ohci_irq_init(i);
+        if (hc->init(hc) < 0)
+            USB_error("OHCI %d init failed!\n", i);
+    }
+}
 
-#ifdef ENABLE_EHCI
-    usbh_ehci_irq_init();
-    ehci_driver.init();
-    ENABLE_EHCI_IRQ();
-#endif
-
+void  usbh_core_start(void)
+{
+    for (int i = 0; i < OHCI_HC_CNT; i++)
+    {
+        HC_DRV_T  *hc = ohci_get_hc(i);
+        hc->rthub_start(hc);
+    }
 }
 
 void  usbh_core_deinit()
@@ -84,26 +76,25 @@ void  usbh_core_deinit()
     if (!usb_core_initialised)
         return;
 
-    UDEV_T * udev = g_udev_list;
-    while (udev != NULL)
-    {
-        disconnect_device(udev);
-        udev = udev->next;
-    }
+    enum_abort();
+
+    /* Children go with their hub */
+    while (g_udev_list != NULL)
+        disconnect_device(g_udev_list);
+
     memset(_drivers, 0, sizeof(_drivers));
 
     g_conn_func = NULL;
     g_disconn_func = NULL;
 
-#ifdef ENABLE_OHCI
-    ohci_driver.shutdown();
-    usbh_ohci_irq_deinit();
-#endif
+    for (int i = 0; i < OHCI_HC_CNT; i++)
+    {
+        HC_DRV_T  *hc = ohci_get_hc(i);
 
-#ifdef ENABLE_EHCI
-    ehci_driver.shutdown();
-    usbh_ehci_irq_deinit();
-#endif
+        hc->rthub_port_reset_cancel(hc);
+        hc->shutdown(hc);
+        usbh_ohci_irq_deinit(i);
+    }
 
     usbh_memory_deinit();
     usb_core_initialised = 0;
@@ -122,129 +113,12 @@ void usbh_install_conn_callback(CONN_FUNC *conn_func, CONN_FUNC *disconn_func)
     g_disconn_func = disconn_func;
 }
 
-static int  reset_device(UDEV_T *udev)
-{
-    if (udev->parent == NULL)
-    {
-        if (udev->hc_driver)
-            return udev->hc_driver->rthub_port_reset(udev->port_num-1);
-        else
-            return USBH_ERR_NOT_FOUND;
-    }
-    else
-    {
-        return udev->parent->port_reset(udev->parent, udev->port_num);
-    }
-}
-
-#ifdef ENABLE_EHCI
-static uint32_t ehci_UCMDR;
-#endif
-
-/**
-  * @brief    Suspend USB Host Controller and devices
-  * @return   None
-  */
-void usbh_suspend()
-{
-#ifdef ENABLE_EHCI
-    int   time_out = 10;   /* ms */
-#endif
-
-#ifdef ENABLE_OHCI
-    /* set port suspend if connected */
-    if (_ohci->HcRhPortStatus[0] & USBH_HcRhPortStatus_CCS_Msk)
-        _ohci->HcRhPortStatus[0] = USBH_HcRhPortStatus_PSS_Msk;    /* set port suspend    */
-
-    if (_ohci->HcRhPortStatus[1] & USBH_HcRhPortStatus_CCS_Msk)
-        _ohci->HcRhPortStatus[1] = USBH_HcRhPortStatus_PSS_Msk;    /* set port suspend    */
-
-    /* enable Device Remote Wakeup */
-    _ohci->HcRhStatus |= USBH_HcRhStatus_DRWE_Msk;
-
-    /* enable USBH RHSC interrupt for system wakeup */
-    _ohci->HcInterruptEnable =  USBH_HcInterruptEnable_RHSC_Msk | USBH_HcInterruptEnable_RD_Msk;
-
-    /* set Host Controller enter suspend state */
-    _ohci->HcControl = (_ohci->HcControl & ~USBH_HcControl_HCFS_Msk) | (3 << USBH_HcControl_HCFS_Pos);
-#endif
-
-#ifdef ENABLE_EHCI
-    ehci_UCMDR = _ehci->UCMDR;
-
-    if (_ehci->UPSCR[0] & HSUSBH_UPSCR_PE_Msk)
-    {
-        _ehci->UPSCR[0] |= HSUSBH_UPSCR_SUSPEND_Msk;
-        delay_us(2000);         /* wait 2 ms */
-    }
-
-    if (_ehci->UPSCR[1] & HSUSBH_UPSCR_PE_Msk)
-    {
-        _ehci->UPSCR[1] |= HSUSBH_UPSCR_SUSPEND_Msk;
-        delay_us(2000);         /* wait 2 ms */
-    }
-
-    _ehci->UCMDR &= ~(HSUSBH_UCMDR_PSEN_Msk | HSUSBH_UCMDR_ASEN_Msk | HSUSBH_UCMDR_RUN_Msk);
-    while (time_out > 0)
-    {
-        if (!(_ehci->UCMDR & HSUSBH_UCMDR_RUN_Msk) && (_ehci->USTSR & HSUSBH_USTSR_HCHalted_Msk))
-        {
-            break;
-        }
-    }
-    if (time_out == 0)
-    {
-        USB_error("usbh_suspend - RUN/HCHalted error!\n");
-    }
-    delay_us(100);
-#endif
-}
-
-
-/**
-  * @brief    Resume USB Host controller and devices
-  * @return   None
-  */
-void usbh_resume(void)
-{
-#ifdef ENABLE_OHCI
-    _ohci->HcControl = (_ohci->HcControl & ~USBH_HcControl_HCFS_Msk) | (2 << USBH_HcControl_HCFS_Pos);
-
-    if (_ohci->HcRhPortStatus[0] & USBH_HcRhPortStatus_PSS_Msk)
-        _ohci->HcRhPortStatus[0] = USBH_HcRhPortStatus_POCI_Msk;   /* clear suspend status */
-    if (_ohci->HcRhPortStatus[1] & USBH_HcRhPortStatus_PSS_Msk)
-        _ohci->HcRhPortStatus[1] = USBH_HcRhPortStatus_POCI_Msk;   /* clear suspend status */
-
-    delay_us(30000);                       /* wait at least 20ms for Host to resume device */
-#endif
-
-#ifdef ENABLE_EHCI
-    _ehci->UCMDR = ehci_UCMDR;
-
-    if (_ehci->UPSCR[0] & HSUSBH_UPSCR_PE_Msk)
-    {
-        _ehci->UPSCR[0] |= HSUSBH_UPSCR_FPR_Msk;
-        delay_us(20000);                         /* keep resume signal for 20 ms */
-        _ehci->UPSCR[0] &= ~HSUSBH_UPSCR_FPR_Msk;
-    }
-
-    if (_ehci->UPSCR[1] & HSUSBH_UPSCR_PE_Msk)
-    {
-        _ehci->UPSCR[1] |= HSUSBH_UPSCR_FPR_Msk;
-        delay_us(20000);                         /* keep resume signal for 20 ms */
-        _ehci->UPSCR[1] &= ~HSUSBH_UPSCR_FPR_Msk;
-    }
-    delay_us(1000);
-#endif
-}
-
-
 
 /// @cond HIDDEN_SYMBOLS
 
 /**
   * @brief    Register an USB device class or vendor driver to lightweight USB stack.
-  *           All USB device drivers must be registered before usbh_core_init() called.
+  *           All USB device drivers must be registered before usbh_core_start() called.
   * @param[in]  udrv   The USB device driver to be registered.
   * @return   Driver registration success or not.
   * @retval   0  Success
@@ -269,76 +143,80 @@ int  usbh_register_driver(UDEV_DRV_T *udrv)
 }
 
 
-/**
-  * @brief    Execute an USB request in control transfer. This function returns after the request
-  *           was done or aborted.
-  * @param[in]  udev            The target USB device.
-  * @param[in]  bmRequestType   Characteristics of request
-  * @param[in]  bRequest        Specific request
-  * @param[in]  wValue          Word-sized field that varies according to request
-  * @param[in]  wIndex          Word-sized field that varies according to request
-  * @param[in]  wLength         Number of bytes to transfer if there is a Data staget
-  * @param[in]  buff            Data buffer used in data staget
-  * @param[in]  data_len        Length of data to be transmitted/received
-  * @param[out] xfer_len        Transmitted/received length of data
-  * @param[in]  timeout         Time-out limit (in 10ms - timer tick) of this transfer
-  * @retval   0     Transfer success
-  * @retval   < 0   Transfer failed. Refer to error code definitions.
-  */
-int usbh_ctrl_xfer(UDEV_T *udev, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
-                   uint16_t wLength, uint8_t *buff, uint32_t *xfer_len, uint32_t timeout)
+/*--------------------------------------------------------------------------*/
+/*   Control transfers                                                      */
+/*--------------------------------------------------------------------------*/
+
+typedef struct ctrl_req_t
 {
-    UTR_T      *utr;
-    uint32_t   t0;
-    int        status;
+    UTR_T           utr;
+    USBH_TIMER_T    timer;
+    USBH_CTRL_FUNC  func;
+    void            *context;
+    int             timed_out;
+} CTRL_REQ_T;
 
-    *xfer_len = 0;
+static void ctrl_req_timeout(void *context)
+{
+    CTRL_REQ_T  *req = (CTRL_REQ_T *)context;
 
-    //if (check_device(udev))
-    //    return USBH_ERR_INVALID_PARAM;
+    /* Pulling the ED completes it as aborted, with the rest queued on it */
+    req->timed_out = 1;
+    usbh_quit_utr(&req->utr);
+}
 
-    utr = alloc_utr(udev);
-    if (utr == NULL)
+static void ctrl_req_done(UTR_T *utr)
+{
+    CTRL_REQ_T  *req = (CTRL_REQ_T *)utr->context;
+    int         status = utr->status;
+
+    usbh_timer_cancel(&req->timer);
+    if (req->timed_out)
+        status = USBH_ERR_TIMEOUT;
+    if (req->func)
+        req->func(utr->udev, status, utr->xfer_len, req->context);
+    usbh_free_mem(req, sizeof(*req));
+}
+
+int usbh_ctrl_xfer_async(UDEV_T *udev, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
+                         uint16_t wLength, uint8_t *buff, uint32_t timeout_ms, USBH_CTRL_FUNC func, void *context)
+{
+    CTRL_REQ_T  *req;
+    UTR_T       *utr;
+    int         ret;
+
+    if ((wLength > 0) && (buff == NULL))
+        return USBH_ERR_INVALID_PARAM;
+
+    req = (CTRL_REQ_T *)usbh_alloc_mem(sizeof(*req));
+    if (req == NULL)
         return USBH_ERR_MEMORY_OUT;
 
+    req->func = func;
+    req->context = context;
+    usbh_timer_init(&req->timer, ctrl_req_timeout, req);
+
+    utr = &req->utr;
+    utr->udev = udev;
     utr->setup.bmRequestType = bmRequestType;
     utr->setup.bRequest   = bRequest;
     utr->setup.wValue     = wValue;
     utr->setup.wIndex     = wIndex;
     utr->setup.wLength    = wLength;
-
     utr->buff = buff;
     utr->data_len = wLength;
-    utr->bIsTransferDone = 0;
-    status = udev->hc_driver->ctrl_xfer(utr);
-    if (status < 0)
+    utr->context = req;
+    utr->func = ctrl_req_done;
+
+    ret = udev->hc_driver->ctrl_xfer(utr);
+    if (ret < 0)
     {
-        udev->ep0.hw_pipe = NULL;
-        free_utr(utr);
-        return status;
+        usbh_free_mem(req, sizeof(*req));
+        return ret;
     }
-
-    t0 = get_ticks();
-    while (utr->bIsTransferDone == 0)
-    {
-        if (get_ticks() - t0 > timeout)
-        {
-            usbh_quit_utr(utr);
-            free_utr(utr);
-            udev->ep0.hw_pipe = NULL;
-            return USBH_ERR_TIMEOUT;
-        }
-    }
-
-    status = utr->status;
-
-    if (status == 0)
-    {
-        *xfer_len = utr->xfer_len;
-    }
-    free_utr(utr);
-
-    return status;
+    if (timeout_ms)
+        usbh_timer_start(&req->timer, timeout_ms);
+    return 0;
 }
 
 
@@ -402,7 +280,7 @@ int usbh_quit_utr(UTR_T *utr)
     if (!utr || !utr->udev)
         return USBH_ERR_NOT_FOUND;
 
-    return utr->udev->hc_driver->quit_xfer(utr, NULL);
+    return utr->udev->hc_driver->quit_xfer(utr->udev->hc_driver, utr, NULL);
 }
 
 
@@ -415,7 +293,67 @@ int usbh_quit_utr(UTR_T *utr)
   */
 int usbh_quit_xfer(UDEV_T *udev, EP_INFO_T *ep)
 {
-    return udev->hc_driver->quit_xfer(NULL, ep);
+    return udev->hc_driver->quit_xfer(udev->hc_driver, NULL, ep);
+}
+
+
+typedef struct set_iface_req_t
+{
+    IFACE_T         *iface;
+    ALT_IFACE_T     *aif;
+    USBH_CTRL_FUNC  func;
+    void            *context;
+} SET_IFACE_REQ_T;
+
+static void set_interface_done(UDEV_T *udev, int status, uint32_t xfer_len, void *context)
+{
+    SET_IFACE_REQ_T  *req = (SET_IFACE_REQ_T *)context;
+
+    if (status == 0)
+        req->iface->aif = req->aif;         /* change active alternative setting          */
+    if (req->func)
+        req->func(udev, status, xfer_len, req->context);
+    usbh_free_mem(req, sizeof(*req));
+}
+
+/**
+ *  @brief    Select an alternate setting for the specified interface.
+ *  @param[in]  iface        The interface
+ *  @param[in]  alt_setting  Desired alternative setting
+ *  @retval   0  Submitted, func gets the result
+ *  @retval   < 0   Failed. Refer to error code definitions.
+ */
+int usbh_set_interface_async(IFACE_T *iface, uint16_t alt_setting, USBH_CTRL_FUNC func, void *context)
+{
+    SET_IFACE_REQ_T  *req;
+    ALT_IFACE_T      *aif = NULL;
+    int              i, ret;
+
+    for (i = 0; i < iface->num_alt; i++)
+    {
+        if (iface->alt[i].ifd->bAlternateSetting == alt_setting)
+        {
+            aif = &iface->alt[i];
+            break;
+        }
+    }
+    if (aif == NULL)
+        return USBH_ERR_NOT_FOUND;          /* cannot find desired alternative setting    */
+
+    req = (SET_IFACE_REQ_T *)usbh_alloc_mem(sizeof(*req));
+    if (req == NULL)
+        return USBH_ERR_MEMORY_OUT;
+    req->iface = iface;
+    req->aif = aif;
+    req->func = func;
+    req->context = context;
+
+    ret = usbh_ctrl_xfer_async(iface->udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_IFACE,
+                               USB_REQ_SET_INTERFACE, alt_setting, iface->if_num, 0,
+                               NULL, 500, set_interface_done, req);
+    if (ret < 0)
+        usbh_free_mem(req, sizeof(*req));
+    return ret;
 }
 
 
@@ -510,217 +448,6 @@ void  dump_config_descriptor(DESC_CONF_T *desc)
         tlen -= bptr[0];
         bptr += bptr[0];
     }
-}
-
-/**
- *  @brief  Execute USB standard request SET ADDRESS.
-  * @param[in]  udev            The target USB device.
- *  @retval   0  Success
- *  @retval   < 0   Failed. Refer to error code definitions.
- */
-int usbh_set_address(UDEV_T *udev)
-{
-    uint32_t  read_len;
-    int       dev_num, ret;
-
-    if (udev->dev_num != 0)
-        return USBH_ERR_SET_DEV_ADDR;
-
-    dev_num = alloc_dev_address();
-
-    /*------------------------------------------------------------------------------------*/
-    /* Issue SET ADDRESS command to set device address                                    */
-    /*------------------------------------------------------------------------------------*/
-    ret = usbh_ctrl_xfer(udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                         USB_REQ_SET_ADDRESS, dev_num, 0, 0,
-                         NULL, &read_len, 100);
-    if (ret < 0)
-    {
-        free_dev_address(dev_num);
-        return ret;
-    }
-
-    udev->dev_num = dev_num;
-
-    return 0;
-}
-
-/**
- *  @brief  Execute USB standard request SET CONFIGURATION.
-  * @param[in]  udev            The target USB device.
- *  @retval   0  Success
- *  @retval   < 0   Failed. Refer to error code definitions.
- */
-int usbh_set_configuration(UDEV_T *udev, uint8_t conf_val)
-{
-    uint32_t  read_len;
-    int       ret;
-
-    /* Current configuration is the same. Do nothing. */
-    if (udev->cur_conf == conf_val)
-        return 0;
-
-    /* Set another configuration is currently not supported! */
-    if (udev->cur_conf != -1)
-        return USBH_ERR_SET_CONFIG;
-
-    /*------------------------------------------------------------------------------------*/
-    /* Issue SET CONFIGURATION command to select device configuration                     */
-    /*------------------------------------------------------------------------------------*/
-    ret = usbh_ctrl_xfer(udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                         USB_REQ_SET_CONFIGURATION, conf_val, 0, 0,
-                         NULL, &read_len, 300);
-    if (ret < 0)
-        return ret;
-
-    udev->cur_conf = (int8_t)conf_val;
-
-    return 0;
-}
-
-/**
- *  @brief    Select an alternate setting for the specified interface.
- *  @param[in]  iface        The interface
- *  @param[in]  alt_setting  Desired alternative setting
- *  @retval   0  Success
- *  @retval   < 0   Failed. Refer to error code definitions.
- */
-int usbh_set_interface(IFACE_T *iface, uint16_t alt_setting)
-{
-    ALT_IFACE_T  *aif = NULL;
-    uint32_t     xfer_len;
-    int          i, ret;
-
-    for (i = 0; i < iface->num_alt; i++)
-    {
-        if (iface->alt[i].ifd->bAlternateSetting == alt_setting)
-        {
-            aif = &iface->alt[i];
-            break;
-        }
-    }
-    if (aif == NULL)
-        return USBH_ERR_NOT_FOUND;          /* cannot find desired alternative setting    */
-
-    ret = usbh_ctrl_xfer(iface->udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_IFACE,
-                         USB_REQ_SET_INTERFACE, alt_setting, iface->if_num, 0,
-                         NULL, &xfer_len, 500);
-    if (ret == 0)
-        iface->aif = aif;                   /* change active alternative setting          */
-    return ret;
-}
-
-/**
- *  @brief  Get device descriptor from the USB device.
-  * @param[in]  udev       The target USB device.
- *  @param[out] desc_buff  Data buffer to receive device descriptor data.
- *  @return   Success or not.
- *  @retval   0  Success
- *  @retval   Otherwise  Failed
- */
-int usbh_get_device_descriptor(UDEV_T *udev, DESC_DEV_T *desc_buff)
-{
-    uint32_t  read_len;
-    int       ret, retry;
-    int       timeout = 5;
-
-    for (retry = 0; retry < 3; retry++)
-    {
-        ret = usbh_ctrl_xfer(udev, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                             USB_REQ_GET_DESCRIPTOR,
-                             ((USB_DT_STANDARD | USB_DT_DEVICE) << 8), 0, sizeof(DESC_DEV_T),
-                             (uint8_t *)desc_buff, &read_len, timeout);
-        if (ret == 0)
-            return 0;
-
-        USB_debug("Get device descriptor failed - %d, retry!\n", ret);
-    }
-    return ret;
-}
-
-/**
- *  @brief  Get configuration descriptor from the USB device.
-  * @param[in]  udev       The target USB device.
- *  @param[out] desc_buff  Data buffer to receive configuration descriptor data.
- *  @param[in]  buff_len   Valid length of <desc_buff>
- *  @return   Success or not.
- *  @retval   0  Success
- *  @retval   Otherwise  Failed
- */
-int usbh_get_config_descriptor(UDEV_T *udev, uint8_t *desc_buff, int buff_len)
-{
-    uint32_t  read_len;
-    DESC_CONF_T  *conf = (DESC_CONF_T *)desc_buff;
-    int       ret;
-
-    /*------------------------------------------------------------------------------------*/
-    /* Issue GET DESCRIPTOR command to get configuration descriptor                       */
-    /*------------------------------------------------------------------------------------*/
-    ret = usbh_ctrl_xfer(udev, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                         USB_REQ_GET_DESCRIPTOR,
-                         ((USB_DT_STANDARD | USB_DT_CONFIGURATION) << 8), 0, 9,
-                         desc_buff, &read_len, 200);
-    if (ret < 0)
-        return ret;
-
-    if (conf->wTotalLength > buff_len)
-    {
-        USB_error("Device configuration %d length > %d!\n", conf->wTotalLength, buff_len);
-        return USBH_ERR_DATA_OVERRUN;
-    }
-
-    read_len = conf->wTotalLength;
-
-    ret = usbh_ctrl_xfer(udev, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                         USB_REQ_GET_DESCRIPTOR,
-                         ((USB_DT_STANDARD | USB_DT_CONFIGURATION) << 8), 0, read_len,
-                         desc_buff, &read_len, 200);
-    if (ret < 0)
-        return ret;
-
-    return 0;
-}
-
-/**
- *  @brief  Get string descriptor from the USB device.
-  * @param[in]  udev       The target USB device.
- *  @param[in]  index      Index of string descriptor
- *  @param[out] desc_buff  Data buffer to receive the string descriptor data.
- *  @param[in]  buff_len   Valid length of <desc_buff>
- *  @return   Success or not.
- *  @retval   0  Success
- *  @retval   Otherwise  Failed
- */
-int usbh_get_string_descriptor(UDEV_T *udev, int index, uint8_t *desc_buff, int buff_len)
-{
-    uint32_t  read_len;
-    int       ret;
-
-    /*------------------------------------------------------------------------------------*/
-    /* Issue GET DESCRIPTOR command to get configuration descriptor                       */
-    /*------------------------------------------------------------------------------------*/
-    ret = usbh_ctrl_xfer(udev, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                         USB_REQ_GET_DESCRIPTOR,
-                         ((USB_DT_STANDARD | USB_DT_STRING) << 8) | index, 0x0409, buff_len,
-                         desc_buff, &read_len, 200);
-    return ret;
-}
-
-/**
- *  @brief  Issue a standard request SET_FEATURE to clear USB device endpoint halt state.
- *  @param[in] ep_addr  Endpoint to be clear halt.
- *  @return   Success or not.
- *  @retval   0  Success
- *  @retval   Otherwise  Failed
- */
-int usbh_clear_halt(UDEV_T *udev, uint16_t ep_addr)
-{
-    uint32_t  read_len;
-
-    USB_debug("Clear endpoint 0x%x halt.\n", ep_addr);
-    return usbh_ctrl_xfer(udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_EP,
-                          USB_REQ_CLEAR_FEATURE, 0, ep_addr, 0,
-                          NULL, &read_len, 100);
 }
 
 static int  usbh_parse_endpoint(ALT_IFACE_T *alt, int ep_idx, uint8_t *desc_buff, int len)
@@ -978,244 +705,485 @@ static int  usbh_parse_configuration(UDEV_T *udev, uint8_t *desc_buff)
     return len;
 }
 
-void print_usb_string(char *lead, uint8_t *str)
-{
-    int  len, i = 2;
 
-    USB_debug("%s", lead);
-    len = str[0];
-    while (i < len)
-    {
-        USB_debug("%c", str[i]);
-        i += 2;
-    }
-    USB_debug("\n");
+/*--------------------------------------------------------------------------*/
+/*   Enumeration                                                            */
+/*--------------------------------------------------------------------------*/
+
+/*
+ *  Ports that connected are queued and enumerated one at a time, since a
+ *  new device answers at address 0 until it's given one. Each step starts
+ *  from the completion of the one before or from a timer, and callbacks carry
+ *  a generation so ones from an attempt that was given up on are dropped.
+ */
+
+#define ENUM_QUEUE_LEN      16
+#define ENUM_BUFF_SIZE      64
+#define ENUM_RETRY          2
+#define ENUM_XFER_TIMEOUT   500
+
+enum
+{
+    ES_IDLE = 0,
+    ES_DEBOUNCE,
+    ES_RESET,
+    ES_RESET_RECOVERY,
+    ES_GET_DESC_SHORT,
+    ES_SET_ADDRESS,
+    ES_ADDRESS_RECOVERY,
+    ES_GET_DESC,
+    ES_GET_CONF_SHORT,
+    ES_GET_CONF,
+    ES_SET_CONF,
+};
+
+static struct
+{
+    HC_DRV_T          *hc;
+    struct hub_dev_t  *hub;
+    int               port;
+} _enum_queue[ENUM_QUEUE_LEN];
+static int _enum_queue_cnt;
+
+static struct
+{
+    int             state;
+    uint32_t        gen;
+    HC_DRV_T        *hc;
+    HUB_DEV_T       *hub;
+    int             port;
+    int             retry;
+    int             speed;
+    int             dev_num;
+    UDEV_T          *udev;
+    uint8_t         *buff;
+    USBH_TIMER_T    timer;
+} _enum;
+
+static void * enum_token(void)
+{
+    return (void *)(uintptr_t)_enum.gen;
 }
 
+static int enum_current(void *token)
+{
+    return (_enum.state != ES_IDLE) && ((uint32_t)(uintptr_t)token == _enum.gen);
+}
 
-int  connect_device(UDEV_T *udev)
+static HC_DRV_T * hub_hc(HUB_DEV_T *hub)
+{
+    return hub->iface->udev->hc_driver;
+}
+
+/* A root hub port is told apart by its controller, a hub's by the hub */
+static UDEV_T * find_child(HC_DRV_T *hc, HUB_DEV_T *hub, int port)
+{
+    UDEV_T  *udev;
+
+    for (udev = g_udev_list; udev != NULL; udev = udev->next)
+    {
+        if ((udev->hc_driver == hc) && (udev->parent == hub) && (udev->port_num == port) &&
+                (udev != _enum.udev))
+            return udev;
+    }
+    return NULL;
+}
+
+UDEV_T * usbh_find_child(HUB_DEV_T *hub, int port)
+{
+    return find_child(hub_hc(hub), hub, port);
+}
+
+/* Frees the device being enumerated, with anything still queued on it */
+static void enum_release_device(void)
+{
+    UDEV_T  *udev = _enum.udev;
+
+    _enum.udev = NULL;
+    if (_enum.dev_num)
+    {
+        free_dev_address(_enum.dev_num);
+        _enum.dev_num = 0;
+    }
+    if (udev != NULL)
+    {
+        usbh_quit_xfer(udev, &udev->ep0);
+        free_device(udev);
+    }
+}
+
+static void enum_stop_port(void)
+{
+    usbh_timer_cancel(&_enum.timer);
+    if (_enum.state == ES_RESET)
+    {
+        if (_enum.hub == NULL)
+            _enum.hc->rthub_port_reset_cancel(_enum.hc);
+        else
+            usbh_hub_port_reset_cancel(_enum.hub);
+    }
+}
+
+static void enum_start_next(void)
+{
+    if ((_enum.state != ES_IDLE) || (_enum_queue_cnt == 0))
+        return;
+
+    _enum.hc = _enum_queue[0].hc;
+    _enum.hub = _enum_queue[0].hub;
+    _enum.port = _enum_queue[0].port;
+    _enum_queue_cnt--;
+    memmove(&_enum_queue[0], &_enum_queue[1], _enum_queue_cnt * sizeof(_enum_queue[0]));
+
+    _enum.gen++;
+    _enum.retry = 0;
+    _enum.state = ES_DEBOUNCE;
+    usbh_timer_start(&_enum.timer, 100);
+}
+
+static void enum_finish(void)
+{
+    _enum.gen++;
+    _enum.state = ES_IDLE;
+    _enum.udev = NULL;
+    _enum.dev_num = 0;
+    enum_start_next();
+}
+
+static void enum_fail(int status)
+{
+    USB_debug("Enumeration of %s port %d failed at step %d! (%d)\n",
+              _enum.hub ? _enum.hub->pos_id : "root", _enum.port, _enum.state, status);
+
+    enum_stop_port();
+    enum_release_device();
+
+    if ((status != USBH_ERR_DISCONNECTED) && (++_enum.retry <= ENUM_RETRY))
+    {
+        /* Start over from the port reset */
+        _enum.gen++;
+        _enum.state = ES_DEBOUNCE;
+        usbh_timer_start(&_enum.timer, 100);
+        return;
+    }
+
+    _enum.gen++;
+    _enum.state = ES_IDLE;
+    enum_start_next();
+}
+
+static void enum_ctrl_done(UDEV_T *udev, int status, uint32_t xfer_len, void *context);
+
+static void enum_request(int state, uint8_t type, uint8_t request, uint16_t value, uint16_t length, uint8_t *buff)
+{
+    int ret;
+
+    _enum.state = state;
+    ret = usbh_ctrl_xfer_async(_enum.udev, type, request, value, 0, length, buff,
+                               ENUM_XFER_TIMEOUT, enum_ctrl_done, enum_token());
+    if (ret < 0)
+        enum_fail(ret);
+}
+
+static void enum_reset_done(int status, int speed, void *context)
+{
+    UDEV_T  *udev;
+
+    if (!enum_current(context) || (_enum.state != ES_RESET))
+        return;
+
+    if (status != USBH_OK)
+    {
+        enum_fail(status);
+        return;
+    }
+
+    udev = alloc_device();
+    if (udev == NULL)
+    {
+        enum_fail(USBH_ERR_MEMORY_OUT);
+        return;
+    }
+    udev->parent = _enum.hub;
+    udev->port_num = _enum.port;
+    udev->speed = (SPEED_E)speed;
+    udev->hc_driver = _enum.hc;
+    _enum.udev = udev;
+
+    _enum.state = ES_RESET_RECOVERY;
+    usbh_timer_start(&_enum.timer, 20);
+}
+
+static void enum_timer(void *context)
+{
+    int  ret;
+
+    switch (_enum.state)
+    {
+    case ES_DEBOUNCE:
+        _enum.state = ES_RESET;
+        if (_enum.hub == NULL)
+            ret = _enum.hc->rthub_port_reset(_enum.hc, _enum.port - 1, enum_reset_done, enum_token());
+        else
+            ret = usbh_hub_port_reset(_enum.hub, _enum.port, enum_reset_done, enum_token());
+        if (ret < 0)
+            enum_fail(ret);
+        break;
+
+    case ES_RESET_RECOVERY:
+        /* Only the first 8 bytes for now, the max packet size is in them */
+        enum_request(ES_GET_DESC_SHORT, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
+                     USB_REQ_GET_DESCRIPTOR, (USB_DT_STANDARD | USB_DT_DEVICE) << 8, 8, _enum.buff);
+        break;
+
+    case ES_ADDRESS_RECOVERY:
+        enum_request(ES_GET_DESC, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
+                     USB_REQ_GET_DESCRIPTOR, (USB_DT_STANDARD | USB_DT_DEVICE) << 8,
+                     sizeof(DESC_DEV_T), _enum.buff);
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void enum_ctrl_done(UDEV_T *udev, int status, uint32_t xfer_len, void *context)
 {
     DESC_CONF_T  *conf;
-    uint8_t      *str_buff;
-    uint32_t     read_len;
+    uint8_t      mps;
     int          ret;
 
-    USB_debug("Connect device =>\n");
+    if (!enum_current(context))
+        return;
 
-    delay_us(100 * 1000);                   /* initially, give 100 ms delay               */
-
-    usbh_get_device_descriptor(udev, &udev->descriptor);
-
-    reset_device(udev);
-
-    delay_us(100 * 1000);
-
-    ret = usbh_set_address(udev);
-    if (ret < 0)
+    if (status != 0)
     {
-        USB_debug("Set address command failed!!\n");
-        return ret;
+        enum_fail(status);
+        return;
     }
 
-    delay_us(100 * 1000);                   /* after set address, give 100 ms delay       */
+    udev = _enum.udev;
 
-    USB_debug("New %s device address %d assigned.\n", (udev->speed == SPEED_HIGH) ? "high-speed" : ((udev->speed == SPEED_FULL) ? "full-speed" : "low-speed"), udev->dev_num);
-
-    /* Get device descriptor again with new device address */
-    ret = usbh_get_device_descriptor(udev, &udev->descriptor);
-    if (ret < 0)
+    switch (_enum.state)
     {
-        free_dev_address(udev->dev_num);
-        return ret;
-    }
-
-#if  defined(DUMP_DESCRIPTOR) && defined(ENABLE_DEBUG_MSG)
-    dump_device_descriptor(&udev->descriptor);
-#endif
-
-    if (udev->descriptor.bNumConfigurations != 1)
-    {
-        USB_debug("Warning! This device has multiple configurations [%d]. \n", udev->descriptor.bNumConfigurations);
-    }
-
-    conf = (DESC_CONF_T *)usbh_alloc_mem(MAX_DESC_BUFF_SIZE);
-    if (conf == NULL)
-    {
-        free_dev_address(udev->dev_num);
-        return USBH_ERR_MEMORY_OUT;
-    }
-
-    udev->cfd_buff = (uint8_t *)conf;
-
-    /* Get configuration descriptor again with new device address */
-    ret = usbh_get_config_descriptor(udev, (uint8_t *)conf, MAX_DESC_BUFF_SIZE);
-    if (ret < 0)
-    {
-        free_dev_address(udev->dev_num);
-        return ret;
-    }
-
-#if  defined(DUMP_DESCRIPTOR) && defined(ENABLE_DEBUG_MSG)
-    dump_config_descriptor(conf);
-#endif
-
-#if 1  /* printf string descriptors, for debug only */
-    str_buff = (uint8_t *)usbh_alloc_mem(64);
-    if (str_buff && udev->descriptor.iManufacturer != 0)
-    {
-        usbh_get_string_descriptor(udev, udev->descriptor.iManufacturer, str_buff, 64);
-        print_usb_string("Manufacturer: ", str_buff);
-    }
-    if (str_buff && udev->descriptor.iProduct != 0)
-    {
-        usbh_get_string_descriptor(udev, udev->descriptor.iProduct, str_buff, 64);
-        print_usb_string("Product: ", str_buff);
-    }
-    if (str_buff && udev->descriptor.iSerialNumber != 0)
-    {
-        usbh_get_string_descriptor(udev, udev->descriptor.iSerialNumber, str_buff, 64);
-        print_usb_string("Serial Number: ", str_buff);
-    }
-    usbh_free_mem(str_buff, 64);
-#endif
-
-    /* Always select the first configuration */
-    ret = usbh_set_configuration(udev, conf->bConfigurationValue);
-    if (ret < 0)
-    {
-        USB_debug("Set configuration %d failed!\n", conf->bConfigurationValue);
-        free_dev_address(udev->dev_num);
-        return ret;
-    }
-
-    /* Parse the configuration/interface/endpoint descriptors and find corresponding drivers. */
-    ret = usbh_parse_configuration(udev, (uint8_t *)conf);
-    if (ret < 0)
-    {
-        USB_debug("Parse configuration %d failed!\n", conf->bConfigurationValue);
-        free_dev_address(udev->dev_num);
-        return ret;
-    }
-
-    if (conf->bmAttributes & (1<<5))
-    {
-        /* Enable remote wakeup                                                                   */
-        if (usbh_ctrl_xfer(udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                           USB_REQ_SET_FEATURE, 0x01, 0x0000, 0x0000,
-                           NULL, &read_len, 300) < 0)
+    case ES_GET_DESC_SHORT:
+        if (xfer_len < 8)
         {
-            USB_debug("Device does not accept remote wakeup enable command.\n");
+            enum_fail(USBH_ERR_DATA_UNDERRUN);
+            break;
         }
+        mps = _enum.buff[7];
+        if ((mps != 8) && (mps != 16) && (mps != 32) && (mps != 64))
+            mps = 8;
+        udev->descriptor.bMaxPacketSize0 = mps;
+
+        _enum.dev_num = alloc_dev_address();
+        enum_request(ES_SET_ADDRESS, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
+                     USB_REQ_SET_ADDRESS, _enum.dev_num, 0, NULL);
+        break;
+
+    case ES_SET_ADDRESS:
+        udev->dev_num = _enum.dev_num;
+        _enum.state = ES_ADDRESS_RECOVERY;
+        usbh_timer_start(&_enum.timer, 10);
+        break;
+
+    case ES_GET_DESC:
+        if (xfer_len < sizeof(DESC_DEV_T))
+        {
+            enum_fail(USBH_ERR_DATA_UNDERRUN);
+            break;
+        }
+        memcpy(&udev->descriptor, _enum.buff, sizeof(DESC_DEV_T));
+
+        USB_debug("New %s device %04x:%04x, address %d.\n",
+                  (udev->speed == SPEED_LOW) ? "low-speed" : "full-speed",
+                  udev->descriptor.idVendor, udev->descriptor.idProduct, udev->dev_num);
+#if  defined(DUMP_DESCRIPTOR) && defined(ENABLE_DEBUG_MSG)
+        dump_device_descriptor(&udev->descriptor);
+#endif
+        if (udev->descriptor.bNumConfigurations != 1)
+            USB_debug("Warning! This device has multiple configurations [%d].\n", udev->descriptor.bNumConfigurations);
+
+        enum_request(ES_GET_CONF_SHORT, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
+                     USB_REQ_GET_DESCRIPTOR, (USB_DT_STANDARD | USB_DT_CONFIGURATION) << 8,
+                     sizeof(DESC_CONF_T), _enum.buff);
+        break;
+
+    case ES_GET_CONF_SHORT:
+        conf = (DESC_CONF_T *)_enum.buff;
+        if ((xfer_len < sizeof(DESC_CONF_T)) || (conf->wTotalLength < sizeof(DESC_CONF_T)))
+        {
+            enum_fail(USBH_ERR_DESCRIPTOR);
+            break;
+        }
+        if (conf->wTotalLength > MAX_DESC_BUFF_SIZE)
+        {
+            USB_error("Device configuration %d length > %d!\n", conf->wTotalLength, MAX_DESC_BUFF_SIZE);
+            enum_fail(USBH_ERR_DATA_OVERRUN);
+            break;
+        }
+
+        udev->cfd_buff = (uint8_t *)usbh_alloc_mem(MAX_DESC_BUFF_SIZE);
+        if (udev->cfd_buff == NULL)
+        {
+            enum_fail(USBH_ERR_MEMORY_OUT);
+            break;
+        }
+        enum_request(ES_GET_CONF, REQ_TYPE_IN | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
+                     USB_REQ_GET_DESCRIPTOR, (USB_DT_STANDARD | USB_DT_CONFIGURATION) << 8,
+                     conf->wTotalLength, udev->cfd_buff);
+        break;
+
+    case ES_GET_CONF:
+        conf = (DESC_CONF_T *)udev->cfd_buff;
+        if (xfer_len < conf->wTotalLength)
+        {
+            enum_fail(USBH_ERR_DATA_UNDERRUN);
+            break;
+        }
+#if  defined(DUMP_DESCRIPTOR) && defined(ENABLE_DEBUG_MSG)
+        dump_config_descriptor(conf);
+#endif
+        /* Always select the first configuration */
+        enum_request(ES_SET_CONF, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
+                     USB_REQ_SET_CONFIGURATION, conf->bConfigurationValue, 0, NULL);
+        break;
+
+    case ES_SET_CONF:
+        conf = (DESC_CONF_T *)udev->cfd_buff;
+        udev->cur_conf = (int8_t)conf->bConfigurationValue;
+
+        /* It's a device from here on, drivers probing it may already queue
+         * transfers on it */
+        _enum.udev = NULL;
+        _enum.dev_num = 0;
+
+        ret = usbh_parse_configuration(udev, (uint8_t *)conf);
+        if (ret < 0)
+            USB_debug("Parse configuration %d failed!\n", conf->bConfigurationValue);
+
+        if (g_conn_func)
+            g_conn_func(udev, 0);
+
+        enum_finish();
+        break;
+
+    default:
+        break;
     }
-
-    if (g_conn_func)
-        g_conn_func(udev, 0);
-
-    return ret;
 }
 
-int  usbh_reset_device(UDEV_T *udev)
+static void enum_init(void)
 {
-    IFACE_T      *iface;
-    DESC_CONF_T  *conf;
-    uint32_t     read_len;
-    int          dev_num, ret;
+    memset(&_enum, 0, sizeof(_enum));
+    _enum_queue_cnt = 0;
+    usbh_timer_init(&_enum.timer, enum_timer, NULL);
+}
 
-    USB_debug("Reset device =>\n");
-
-    usbh_pooling_hubs();
-
-    /*------------------------------------------------------------------------------------*/
-    /*  Disconnect device                                                                 */
-    /*------------------------------------------------------------------------------------*/
-
-    if (g_disconn_func)
-        g_disconn_func(udev, 0);
-
-    usbh_quit_xfer(udev, &(udev->ep0));    /* Quit control transfer if hw_pipe is not NULL.  */
-
-    /* Notified all actived interface device driver  */
-    iface = udev->iface_list;
-    while (iface != NULL)
+static void enum_abort(void)
+{
+    if (_enum.state != ES_IDLE)
     {
-        udev->iface_list = iface->next;
-        iface->driver->disconnect(iface);
-        usbh_free_mem(iface, sizeof(*iface));
-        iface = udev->iface_list;
+        enum_stop_port();
+        enum_release_device();
+        _enum.gen++;
+        _enum.state = ES_IDLE;
     }
-
-    /*------------------------------------------------------------------------------------*/
-    /*  Reset device                                                                      */
-    /*------------------------------------------------------------------------------------*/
-
-    reset_device(udev);
-
-    delay_us(100 * 1000);
-
-    /*------------------------------------------------------------------------------------*/
-    /*  Set address (use current address)                                                 */
-    /*------------------------------------------------------------------------------------*/
-
-    dev_num = udev->dev_num;
-    udev->dev_num = 0;
-    /* Issue SET ADDRESS command to set the same device address                           */
-    ret = usbh_ctrl_xfer(udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                         USB_REQ_SET_ADDRESS, dev_num, 0, 0,
-                         NULL, &read_len, 100);
-    udev->dev_num = dev_num;
-    if (ret < 0)
-        return ret;
-
-    delay_us(100 * 1000);                   /* after set address, give 100 ms delay       */
-
-    /*------------------------------------------------------------------------------------*/
-    /*  Get device descriptor                                                             */
-    /*------------------------------------------------------------------------------------*/
-
-    /* Get device descriptor again with new device address */
-    ret = usbh_get_device_descriptor(udev, &udev->descriptor);
-    if (ret < 0)
-        return ret;
-
-    /*------------------------------------------------------------------------------------*/
-    /*  Get configuration descriptor                                                      */
-    /*------------------------------------------------------------------------------------*/
-
-    conf = (DESC_CONF_T *)udev->cfd_buff;   /* using the previously allocated buffer      */
-
-    /* Get configuration descriptor again with new device address */
-    ret = usbh_get_config_descriptor(udev, (uint8_t *)conf, MAX_DESC_BUFF_SIZE);
-    if (ret < 0)
-        return ret;
-
-    /* Always select the first configuration */
-    ret = usbh_set_configuration(udev, udev->cur_conf);
-    if (ret < 0)
+    _enum_queue_cnt = 0;
+    if (_enum.buff)
     {
-        USB_debug("Set configuration %d failed!\n", udev->cur_conf);
-        return ret;
+        usbh_free_mem(_enum.buff, ENUM_BUFF_SIZE);
+        _enum.buff = NULL;
     }
+}
 
-    /* Parse the configuration/interface/endpoint descriptors and find corresponding drivers. */
-    ret = usbh_parse_configuration(udev, (uint8_t *)conf);
-    if (ret < 0)
+static void enum_dequeue(HC_DRV_T *hc, HUB_DEV_T *hub, int port)
+{
+    int  i;
+
+    for (i = 0; i < _enum_queue_cnt; )
     {
-        USB_debug("Parse configuration %d failed!\n", conf->bConfigurationValue);
-        return ret;
+        if ((_enum_queue[i].hc == hc) && (_enum_queue[i].hub == hub) && (_enum_queue[i].port == port))
+        {
+            _enum_queue_cnt--;
+            memmove(&_enum_queue[i], &_enum_queue[i+1], (_enum_queue_cnt - i) * sizeof(_enum_queue[0]));
+        }
+        else
+            i++;
     }
+}
 
-    /* Enable remote wakeup                                                                   */
-    if (usbh_ctrl_xfer(udev, REQ_TYPE_OUT | REQ_TYPE_STD_DEV | REQ_TYPE_TO_DEV,
-                       USB_REQ_SET_FEATURE, 0x01, 0x0000, 0x0000,
-                       NULL, &read_len, 300) < 0)
+/* Gives up on the port if it's the one being enumerated */
+static void enum_drop_port(HC_DRV_T *hc, HUB_DEV_T *hub, int port)
+{
+    enum_dequeue(hc, hub, port);
+
+    if ((_enum.state != ES_IDLE) && (_enum.hc == hc) && (_enum.hub == hub) && (_enum.port == port))
     {
-        USB_debug("Device not accept remote wakeup enable command.\n");
+        enum_stop_port();
+        enum_release_device();
+        _enum.gen++;
+        _enum.state = ES_IDLE;
     }
+}
 
-    if (g_conn_func)
-        g_conn_func(udev, 0);
+static void port_connected(HC_DRV_T *hc, HUB_DEV_T *hub, int port)
+{
+    UDEV_T  *udev;
 
-    return ret;
+    enum_drop_port(hc, hub, port);
+
+    /* A device that was there is gone, whatever comes up now is new */
+    while ((udev = find_child(hc, hub, port)) != NULL)
+        disconnect_device(udev);
+
+    if (_enum.buff == NULL)
+        _enum.buff = (uint8_t *)usbh_alloc_mem(ENUM_BUFF_SIZE);
+
+    if ((_enum.buff != NULL) && (_enum_queue_cnt < ENUM_QUEUE_LEN))
+    {
+        _enum_queue[_enum_queue_cnt].hc = hc;
+        _enum_queue[_enum_queue_cnt].hub = hub;
+        _enum_queue[_enum_queue_cnt].port = port;
+        _enum_queue_cnt++;
+    }
+    else
+        USB_error("Can't queue %s port %d for enumeration!\n", hub ? hub->pos_id : "root", port);
+
+    enum_start_next();
+}
+
+static void port_disconnected(HC_DRV_T *hc, HUB_DEV_T *hub, int port)
+{
+    UDEV_T  *udev;
+
+    enum_drop_port(hc, hub, port);
+
+    while ((udev = find_child(hc, hub, port)) != NULL)
+        disconnect_device(udev);
+
+    enum_start_next();
+}
+
+void usbh_port_connected(HUB_DEV_T *hub, int port)
+{
+    port_connected(hub_hc(hub), hub, port);
+}
+
+void usbh_port_disconnected(HUB_DEV_T *hub, int port)
+{
+    port_disconnected(hub_hc(hub), hub, port);
+}
+
+void usbh_rh_port_connected(HC_DRV_T *hc, int port)
+{
+    port_connected(hc, NULL, port);
+}
+
+void usbh_rh_port_disconnected(HC_DRV_T *hc, int port)
+{
+    port_disconnected(hc, NULL, port);
 }
 
 void disconnect_device(UDEV_T *udev)
@@ -1227,7 +1195,8 @@ void disconnect_device(UDEV_T *udev)
     if (g_disconn_func)
         g_disconn_func(udev, 0);
 
-    usbh_quit_xfer(udev, &(udev->ep0));    /* Quit control transfer if hw_pipe is not NULL.  */
+    /* Completes anything queued on it as aborted, after the next frame */
+    usbh_quit_xfer(udev, &(udev->ep0));
 
     /* Notified all actived interface device driver  */
     iface = udev->iface_list;
@@ -1242,31 +1211,7 @@ void disconnect_device(UDEV_T *udev)
     /* remove device from global device list */
     free_dev_address(udev->dev_num);
     free_device(udev);
-
-    usbh_memory_used();
 }
-
-#if 0
-static int  check_device(UDEV_T *udev)
-{
-    UDEV_T  *d;
-
-    if (udev == NULL)
-        return USBH_ERR_INVALID_PARAM;
-
-    //if ((udev->hc_driver != &ohci_driver) && (udev->hc_driver != &ehci_driver))
-    //  return USBH_ERR_INVALID_PARAM;
-
-    d = g_udev_list;
-    while (d)
-    {
-        if (d == udev)
-            return USBH_OK;
-        d = d->next;
-    }
-    return USBH_ERR_INVALID_PARAM;
-}
-#endif
 
 EP_INFO_T * usbh_iface_find_ep(IFACE_T *iface, uint8_t ep_addr, uint8_t dir_type)
 {
@@ -1339,6 +1284,9 @@ void usbh_dump_ep_info(EP_INFO_T *ep)
     USB_debug("  wMaxPacketSize      = %d\n",     ep->wMaxPacketSize);
     USB_debug("  hw_pipe             = 0x%x\n",   (int)ep->hw_pipe);
 }
+
+/// @endcond HIDDEN_SYMBOLS
+
 
 /// @endcond HIDDEN_SYMBOLS
 

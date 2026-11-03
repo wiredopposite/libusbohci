@@ -105,18 +105,40 @@ DESC_HUB_T;
 /* 4 can support up to 32 port hubs                */
 /* Note!! If modeifed to 4, "uint16_t sc_bitmap"   */
 /*        MUST be changed as "uint32_t sc_bitmap"  */
+typedef void (*PORT_RESET_DONE)(int status, int speed, void *context);
+
 typedef struct hub_dev_t
 {
     IFACE_T    *iface;                 /*!< Interface device of this hub          \hideinitializer */
     UTR_T      *utr;                   /*!< Interrupt in UTR of this hub          \hideinitializer */
-    // uint8_t    buff[HUB_STATUS_MAX_BYTE];   /*!< Interrupt in buffer              \hideinitializer */
     uint16_t   sc_bitmap;              /*!< Hub and Port Status Change Bitmap     \hideinitializer */
     uint8_t    bNbrPorts;              /*!< Number of ports                       \hideinitializer */
     uint8_t    bPwrOn2PwrGood;         /*!< Hub power on to power good time       \hideinitializer */
     char       pos_id[MAX_HUB_DEVICE+1];   /*!< Hub position identifier           \hideinitializer */
-    int        (*port_reset)(struct hub_dev_t *hub, int port);/*!< Port reset function                   \hideinitializer */
-    UDEV_T     *children;              /*!< Child device list.                    \hideinitializer */
+    uint32_t   gen;                    /*!< Bumped when the slot is freed, for late callbacks      */
+
+    /* Setup, then handling status changes, one control transfer at a time */
+    int        state;
+    int        port;                   /*!< Port being set up or handled          \hideinitializer */
+    uint16_t   wStatus, wChange;
+    uint16_t   pending;                /*!< Changes reported while handling others                 */
+    uint8_t    *buff;
+    USBH_TIMER_T timer;
+
+    /* Port reset, which runs alongside status handling */
+    int        rst_port;
+    int        rst_state;
+    int        rst_retry;
+    int        rst_elapsed;
+    int        rst_time;
+    PORT_RESET_DONE rst_done;
+    void       *rst_context;
+    uint8_t    *rst_buff;
+    USBH_TIMER_T rst_timer;
 } HUB_DEV_T;
+
+extern int  usbh_hub_port_reset(HUB_DEV_T *hub, int port, PORT_RESET_DONE done, void *context);
+extern void usbh_hub_port_reset_cancel(HUB_DEV_T *hub);
 
 
 /// @endcond

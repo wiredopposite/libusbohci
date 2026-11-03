@@ -254,22 +254,6 @@ void  *USB_malloc(INT wanted_size, INT boundary)
     void      *p = NULL;
     uint32_t  size;
     INT       i;
-    int       disable_ohci_irq, disable_ehci_irq;
-
-    if (IS_OHCI_IRQ_ENABLED())
-        disable_ohci_irq = 1;
-    else
-        disable_ohci_irq = 0;
-
-    if (IS_EHCI_IRQ_ENABLED())
-        disable_ehci_irq = 1;
-    else
-        disable_ehci_irq = 0;
-
-    if (disable_ohci_irq)
-        DISABLE_OHCI_IRQ();
-    if (disable_ehci_irq)
-        DISABLE_EHCI_IRQ();
 
     for (i = 0; (i < USB_MEMORY_POOL_MAX_CHUNKS) && (p == NULL); i++)
     {
@@ -298,10 +282,6 @@ void  *USB_malloc(INT wanted_size, INT boundary)
     if (p == NULL)
         sysprintf("USB_malloc - No free memory! want=%d, free=%d\n", wanted_size, _FreeMemorySize);
 
-    if (disable_ohci_irq)
-        ENABLE_OHCI_IRQ();
-    if (disable_ehci_irq)
-        ENABLE_EHCI_IRQ();
     return p;
 }
 
@@ -312,32 +292,12 @@ void  USB_free(void *alloc_addr)
     USB_MHDR_T  *pMblk;
     UINT32  addr = (UINT32)alloc_addr;
     INT     i, count;
-    int     disable_ohci_irq, disable_ehci_irq;
-
-    if (IS_OHCI_IRQ_ENABLED())
-        disable_ohci_irq = 1;
-    else
-        disable_ohci_irq = 0;
-
-    if (IS_EHCI_IRQ_ENABLED())
-        disable_ehci_irq = 1;
-    else
-        disable_ehci_irq = 0;
 
     //sysprintf("USB_free: 0x%x\n", (int)alloc_addr);
-
-    if (disable_ohci_irq)
-        DISABLE_OHCI_IRQ();
-    if (disable_ehci_irq)
-        DISABLE_EHCI_IRQ();
 
     chunk = chunk_from_address(addr);
     if (chunk == NULL)
     {
-        if (disable_ohci_irq)
-            ENABLE_OHCI_IRQ();
-        if (disable_ehci_irq)
-            ENABLE_EHCI_IRQ();
         if (addr)
             free(alloc_addr);
         return;
@@ -354,10 +314,6 @@ void  USB_free(void *alloc_addr)
     if (addr % USB_MEM_BLOCK_SIZE != 0)
     {
         sysprintf("USB_free fatal error on address: %x!!\n", (UINT32)alloc_addr);
-        if (disable_ohci_irq)
-            ENABLE_OHCI_IRQ();
-        if (disable_ehci_irq)
-            ENABLE_EHCI_IRQ();
         return;
     }
 
@@ -365,19 +321,11 @@ void  USB_free(void *alloc_addr)
     if (pMblk->flag == 0)
     {
         sysprintf("USB_free(), warning - try to free a free block: %x\n", (UINT32)alloc_addr);
-        if (disable_ohci_irq)
-            ENABLE_OHCI_IRQ();
-        if (disable_ehci_irq)
-            ENABLE_EHCI_IRQ();
         return;
     }
     if (pMblk->magic != USB_MEM_ALLOC_MAGIC)
     {
         sysprintf("USB_free(), warning - try to free an unknow block at address:%x.\n", addr);
-        if (disable_ohci_irq)
-            ENABLE_OHCI_IRQ();
-        if (disable_ehci_irq)
-            ENABLE_EHCI_IRQ();
         return;
     }
 
@@ -398,10 +346,6 @@ void  USB_free(void *alloc_addr)
     if ((chunk != &_chunks[0]) && (chunk->free_size == chunk->end - chunk->base))
         chunk_destroy(chunk);
 
-    if (disable_ohci_irq)
-        ENABLE_OHCI_IRQ();
-    if (disable_ehci_irq)
-        ENABLE_EHCI_IRQ();
     return;
 }
 

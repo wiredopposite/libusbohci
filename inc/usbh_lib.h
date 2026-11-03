@@ -167,8 +167,8 @@ typedef enum image_format_e
 /*   User exported functions (Must be created by user application)                        */
 /*----------------------------------------------------------------------------------------*/
 //Initialise/Uninitialise the systems ohci irq and irq handler.
-void usbh_ohci_irq_init(void);
-void usbh_ohci_irq_deinit(void);
+void usbh_ohci_irq_init(int index);
+void usbh_ohci_irq_deinit(int index);
 //Initialise/Uninitialise the systems ehci irq and irq handler.
 void usbh_ehci_irq_init(void);
 void usbh_ehci_irq_deinit(void);
@@ -186,18 +186,34 @@ void *usbh_dma_to_virt(void *physical_address);
 void *usbh_virt_to_dma(void *virtual_address);
 //Debug printer output.
 void usbh_sysprintf(const char *format);
+//One-shot timer. Its callback runs at the same level as the interrupt handler,
+//which is where everything in the stack runs.
+typedef struct usbh_timer
+{
+    uint64_t opaque[12];
+} USBH_TIMER_T;
+void usbh_timer_init(USBH_TIMER_T *timer, void (*func)(void *context), void *context);
+void usbh_timer_start(USBH_TIMER_T *timer, uint32_t ms);
+//No callback runs after this returns.
+void usbh_timer_cancel(USBH_TIMER_T *timer);
 
 /*------------------------------------------------------------------*/
 /*                                                                  */
 /*  USB Core Library APIs                                           */
 /*                                                                  */
 /*------------------------------------------------------------------*/
+/*
+ *  Nothing in the stack blocks. Device enumeration, hubs and transfer
+ *  completions all run from the controller interrupt and from timers, and
+ *  everything else must be called at that same level, never preempted by it.
+ *  The exceptions are usbh_core_init and usbh_core_deinit, which reset the
+ *  controller and wait for it.
+ */
 extern void usbh_core_init(void);
 extern void usbh_core_deinit(void);
-extern int  usbh_pooling_hubs(void);
+/* Starts handling root hub port changes, once the drivers are registered */
+extern void usbh_core_start(void);
 extern void usbh_install_conn_callback(CONN_FUNC *conn_func, CONN_FUNC *disconn_func);
-extern void usbh_suspend(void);
-extern void usbh_resume(void);
 extern struct udev_t * usbh_find_device(char *hub_id, int port);
 extern uint32_t get_ticks(void);   /* This function must be provided by user application. */
 
@@ -293,9 +309,7 @@ extern void usbh_install_uvc_conn_callback(UVC_CONN_FUNC *conn_func, UVC_CONN_FU
 
 /// @cond HIDDEN_SYMBOLS
 
-extern void dump_ohci_regs(void);
 extern void dump_ehci_regs(void);
-extern void dump_ohci_ports(void);
 extern void dump_ehci_ports(void);
 extern uint32_t  usbh_memory_used(void);
 

@@ -1593,21 +1593,24 @@ typedef struct __attribute__((__packed__)) usb_endpoint_descriptor  /*!< Endpoin
 /*----------------------------------------------------------------------------------*/
 /*  USB Host controller driver                                                      */
 /*----------------------------------------------------------------------------------*/
-typedef struct
+typedef struct hc_drv_t
 {
-    int   (*init) (void);
-    void  (*shutdown) (void);
-    void  (*suspend) (void);
-    void  (*resume) (void);
+    int   (*init) (struct hc_drv_t *hc);
+    void  (*shutdown) (struct hc_drv_t *hc);
+    void  (*suspend) (struct hc_drv_t *hc);
+    void  (*resume) (struct hc_drv_t *hc);
     int   (*ctrl_xfer)(struct utr_t *utr);
     int   (*bulk_xfer)(struct utr_t *utr);
     int   (*int_xfer)(struct utr_t *utr);
     int   (*iso_xfer)(struct utr_t *utr);
-    int   (*quit_xfer)(struct utr_t *utr, struct ep_info_t *ep);
+    int   (*quit_xfer)(struct hc_drv_t *hc, struct utr_t *utr, struct ep_info_t *ep);
 
     /* root hub support */
-    int   (*rthub_port_reset)(int port);
-    int   (*rthub_polling) (void);
+    int   (*rthub_port_reset)(struct hc_drv_t *hc, int port, void (*done)(int status, int speed, void *context), void *context);
+    void  (*rthub_port_reset_cancel)(struct hc_drv_t *hc);
+    void  (*rthub_start)(struct hc_drv_t *hc);
+
+    int   index;                        /*!< host controller number               */
 } HC_DRV_T;
 
 
@@ -1715,11 +1718,7 @@ typedef struct utr_t
 /*----------------------------------------------------------------------------------*/
 /*  Global variables                                                                */
 /*----------------------------------------------------------------------------------*/
-extern USBH_T      *_ohci;
-extern HSUSBH_T    *_ehci;
-
-extern HC_DRV_T    ohci_driver;
-extern HC_DRV_T    ehci_driver;
+extern HC_DRV_T * ohci_get_hc(int index);
 
 extern UDEV_T * g_udev_list;
 
@@ -1733,9 +1732,9 @@ extern void sysprintf(const char *format, ...);
 extern void *dma_to_virt(void *physical_address);
 extern void *virt_to_dma(void *virtual_address);
 
-extern void dump_ohci_regs(void);
-extern void dump_ohci_ports(void);
-extern void dump_ohci_int_table(void);
+extern void dump_ohci_regs(HC_DRV_T *hc);
+extern void dump_ohci_ports(HC_DRV_T *hc);
+extern void dump_ohci_int_table(HC_DRV_T *hc);
 extern void dump_ehci_regs(void);
 extern void dump_ehci_qtd(qTD_T *qtd);
 extern void dump_ehci_asynclist(void);
@@ -1781,22 +1780,32 @@ extern void free_ehci_siTD(siTD_T *sitd);
 
 
 extern void usbh_hub_init(void);
-extern int  connect_device(UDEV_T *);
 extern void disconnect_device(UDEV_T *);
 extern int  usbh_register_driver(UDEV_DRV_T *driver);
 extern EP_INFO_T * usbh_iface_find_ep(IFACE_T *iface, uint8_t ep_addr, uint8_t dir_type);
-extern int  usbh_reset_device(UDEV_T *);
 
 /*
- *  USB Standard Request functions
+ *  Hub port events, from the root hub or a hub device. Connecting queues the
+ *  port for enumeration, which runs one device at a time.
  */
-extern int usbh_get_device_descriptor(UDEV_T *udev, DESC_DEV_T *desc_buff);
-extern int usbh_get_config_descriptor(UDEV_T *udev, uint8_t *desc_buff, int buff_len);
-extern int usbh_set_configuration(UDEV_T *udev, uint8_t conf_val);
-extern int usbh_set_interface(IFACE_T *iface, uint16_t alt_setting);
-extern int usbh_clear_halt(UDEV_T *udev, uint16_t ep_addr);
+struct hub_dev_t;
+extern void usbh_port_connected(struct hub_dev_t *hub, int port);
+extern void usbh_port_disconnected(struct hub_dev_t *hub, int port);
+extern void usbh_rh_port_connected(HC_DRV_T *hc, int port);
+extern void usbh_rh_port_disconnected(HC_DRV_T *hc, int port);
+extern UDEV_T * usbh_find_child(struct hub_dev_t *hub, int port);
 
-extern int usbh_ctrl_xfer(UDEV_T *udev, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex, uint16_t wLength, uint8_t *buff, uint32_t *xfer_len, uint32_t timeout);
+/*
+ *  Control transfer that completes through a callback. The request and its
+ *  timer are allocated here, buff must be DMA memory from usbh_alloc_mem or
+ *  the caller's own, and may be NULL if wLength is 0. A timeout aborts every
+ *  control transfer queued on the device.
+ */
+typedef void (*USBH_CTRL_FUNC)(UDEV_T *udev, int status, uint32_t xfer_len, void *context);
+extern int usbh_ctrl_xfer_async(UDEV_T *udev, uint8_t bmRequestType, uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
+                                uint16_t wLength, uint8_t *buff, uint32_t timeout_ms, USBH_CTRL_FUNC func, void *context);
+extern int usbh_set_interface_async(IFACE_T *iface, uint16_t alt_setting, USBH_CTRL_FUNC func, void *context);
+
 extern int usbh_bulk_xfer(UTR_T *utr);
 extern int usbh_int_xfer(UTR_T *utr);
 extern int usbh_iso_xfer(UTR_T *utr);
